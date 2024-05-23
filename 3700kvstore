@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os
+from enum import Enum
+from random import uniform
+
+# partitiion is when there is a division between two side. And since replica does not
+# recieve any heart beat they will start a new election with a higher term. When the
+# partition disappears the higher term one will become the new leader
+
+BROADCAST = "FFFF"
+TIMEOUT = [0.5, 0.75]
+RPC_TIMEOUT = 0.075
+HEARTBEAT = 'heartbeat'
+HEARTBEAT_TIMEOUT = 0.1
+REQ_VOTE = 'request vote'
+APPEND = 'append_entries'
+VOTE = 'vote'
+FAIL = 'fail'
+MID = 'MID'
+TYPE = 'type'
+GET = 'get'
+PUT = 'put'
+KEY = 'key'
+OK = 'ok'
+SRC = 'src'
+RED = 'redirect'
+TERM = 'term'
+LED = 'leader'
+VAL = 'value'
+INDEX = 'index'
+ENTRIES = 'entries'
+COMMIT = 'commit'
+
+
+class Role(Enum):
+    FOLLOWER = 1
+    CANDIDATE = 2
+    LEADER = 3
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.quorum = math.floor(len(others) / 2) + 1 
+
+        #data
+        self.data = {}
+
+        #Replica Log
+        self.currentLength = 0
+        self.log = []
+        self.log_quorum = []
+        self.new_entries = 0
+        self.lastIndexCommitted = -1
+
+        #Election
+        self.vote_for_term = {}
+        self.vote_for_term[0] = '0004'
+        self.votes = 0
+        self.term = 1
+        self.leader = '0004'
+        if self.id == '0004':
+            self.role = Role.LEADER
+        else:
+            self.role = Role.FOLLOWER
+
+        # Timeout
+        self.timeout = None
+        self.reset_timeout()
+        self.rpc_timeout = None
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+
+    # create the default message
+    def default_message_builder(self, req_type, dst, mid):
+        msg = {
+            'src': self.id,
+            'dst': dst,
+            'leader': self.leader,
+            'term': self.term,
+            'index': self.currentLength - 1,
+            'MID': mid,
+            'type': req_type
+        }
+        return msg
+
+    # reset our current timeout
+    def reset_timeout(self):
+        if self.role in [Role.FOLLOWER, Role.CANDIDATE]:
+            self.timeout = time.time() + uniform(TIMEOUT[0], TIMEOUT[1])
+        elif self.role == Role.LEADER:
+            self.timeout = time.time() + HEARTBEAT_TIMEOUT
+
+    # ========================== LEADER ELECTION =======================
+
+    # Start election
+    def start_election(self):
+        # Immediately enter a new term
+        self.term += 1
+
+        # Follower becomes candidate
+        self.role = Role.CANDIDATE
+
+        # Abandon leader and set to broadcast RequestVotes RPCs
+        self.leader = BROADCAST
+
+        # Candidate votes for itself
+        self.votes += 1
+
+        # Send RequestVotes RPCs to all other replicas
+        self.request_vote()
+
+
+    # Sends RequestVotes RPCs to all other replicas with own <term, index>
+    def request_vote(self):
+        # Build RequestVotes RPC
+        request = self.default_message_builder(REQ_VOTE, BROADCAST, '')
+
+        # Send RequestVotes RPCs
+        self.send(request)
+
+    # Send Vote RPC to requesting candidate and become a follower
+    def send_vote(self, req):
+
+        # Become a Follower
+        self.role = Role.FOLLOWER
+        self.votes = 0
+
+        # Remember candidate voted for in election term
+        self.vote_for_term[int(req[TERM])] = req[SRC]
+
+        # Reset timeout 
+        self.reset_timeout()
+
+        # Build Vote RPC 
+        vote_rpc = self.default_message_builder(VOTE, req[SRC], req[MID])
+
+        # Send Vote RPC to requesting candidate
+        self.send(vote_rpc)
+
+    # Count vote and become leader, if possible
+    def count_vote(self):
+        # Increment own vote
+        self.votes += 1
+
+        # Become a leader if candidate has majority votes
+        if self.votes >= self.quorum:
+            self.become_leader()
+
+    # Elected leader in the new term
+    def become_leader(self):
+        # Set self to leader
+        self.role = Role.LEADER
+        self.leader = self.id
+
+        # Set 0-populated log_quorum
+        self.log_quorum = [0] * len(self.log)
+        for i in range(self.lastIndexCommitted + 1):
+            self.log_quorum[i] = self.quorum
+
+        # Set new timeout for leader
+        self.reset_timeout()
+
+        # Garbage-clean
+        self.votes = 0
+
+    # Given an RPC, updates term and leader if applicable
+    def update_term(self, req):
+        # Updates new term and leader if own term is out-of-date
+        if int(req[TERM]) > self.term:
+            self.term = int(req[TERM])
+            self.leader = req[SRC]
+            self.log_quorum = None
+
+    # ================================ RECEIVED MESSAGE HANDLERS =============================
+
+    # Handles RequestVote RPCs 
+    # - Sends a vote only to a valid requesting candidate, else does not send
+    def vote_request_handler(self, message):
+        req = json.loads(message)
+
+        # Only send vote if this replica has not voted for this term, or if 
+        # the candidate's <term, index> is more up-to-date than own
+        if req[TERM] not in self.vote_for_term.keys() \
+            or int(req[TERM]) > self.term \
+            or (int(req[TERM]) == self.term and int(req[INDEX]) > self.currentLength - 1):
+            self.send_vote(req)
+            
+    # Handles GET requests from client
+    def get_handler(self, message):
+        req = json.loads(message)
+
+        # Redirect GET request to leader
+        if self.role == Role.FOLLOWER and self.leader != BROADCAST:
+            msg = self.default_message_builder(RED, req[SRC], req[MID])
+            self.send(msg)
+        # Ignore GET request
+        elif self.role == Role.CANDIDATE:
+            print('candidate drop GET request')
+        # Accept GET request and respond to client
+        elif self.role == Role.LEADER:
+            # If key exists, return OK and its value
+            if req[KEY] in self.data.keys():
+                value = self.data.get(req[KEY])
+                msg = self.default_message_builder(OK, req[SRC], req[MID])
+                msg[VAL] = value
+            # If key doesn't exist, return OK and empty value 
+            else:
+                msg = self.default_message_builder(FAIL, req[SRC], req[MID])
+            # elif: May require a third fail case. Not sure what context it would be needed though.
+            
+            # Send response to client
+            self.send(msg)
+
+
+    # Handles PUT requests from client
+    def put_handler(self, message):
+        req = json.loads(message)
+
+        # Redirect PUT request to leader
+        if self.role == Role.FOLLOWER and self.leader != BROADCAST:
+            msg = self.default_message_builder(RED, req[SRC], req[MID])
+            self.send(msg)
+        # Ignore PUT request
+        elif self.role == Role.CANDIDATE: 
+            print('candidate drop PUT request')
+        # Accept PUT request and attempt to commit
+        elif self.role == Role.LEADER:
+            next_entry_index = len(self.log)
+            # Build given entry
+            entry = {
+                MID: req[MID],
+                INDEX : next_entry_index,
+                TERM : self.term,
+                KEY : req[KEY],
+                VAL : req[VAL],
+                SRC : req[SRC],
+                LED : self.id
+            }
+            # Append uncommitted entry to leader's log
+            self.log.append(entry)
+            self.currentLength += 1
+            self.log_quorum.append(0)
+            self.new_entries += 1
+
+    # Handles AppendEntries RPCs from leader (includes receiving heartbeat messages)
+    def append_handler(self, message):
+        req = json.loads(message)
+        
+        # Ignore RPCs from previous terms
+        if int(req[TERM]) < self.term:
+            self.reset_timeout()
+            print("obsolete RPC")
+            return
+
+        # Update term, if applicable
+        self.update_term(req)
+
+        if self.role == Role.FOLLOWER:
+
+            # If RPC contains entries, attempt to append and indicate result to leader 
+            if "entries" in req.keys():
+
+                # Add entries to buffer, remember req[NUM_ENTRIES] as bufferLength. Only if len(buffer) 
+                # = bufferLength, attempt rest of if statement with entries = buffer. Clear buffer after sending "ok". 
+                # Else, append req[ENTRIES] to buffer. # may need additional code for back-and-forth and prevent
+                # breaking
+                # 
+                # If bufferLength != req[NUM_ENTRIES]: update bufferLength and clear buffer
+
+                # TODO
+            
+                # If own log is same as leader's in RPC, then exit to prevent over-counting quorum
+                # - Matching length of log and current term suffices, provided by Consistency Check
+                if self.currentLength != 0:
+                    if self.currentLength - 1 == int(req[INDEX]) and self.term == int(req[TERM]):
+                        self.reset_timeout()
+                        return
+                
+                # Entries should try to be appended starting at index given by append_from
+                prevIndex = int(req["appendFrom"]) - 1
+                prevTerm = int(req["matchTerm"])
+                append_from = self.check_consistency(prevIndex, prevTerm)
+                
+                # If "ok", append/overwrite with leader's log and respond to leader
+                if append_from == int(req["appendFrom"]) or append_from == 0:
+                    entries = req[ENTRIES]
+
+                    # Append/overwrite leader's entries appending from the given index
+                    del self.log[append_from:len(self.log)]
+                    self.log += entries
+                    self.currentLength = len(self.log)
+
+                    # Respond with "ok" including index of last entry to count quorum
+                    msg = self.default_message_builder(OK, self.leader, '')
+                    msg[INDEX] = len(self.log) - 1
+                    self.send(msg)
+                else:
+                    # Respond with "fail" including index of earlier index to try and append from
+                    msg = self.default_message_builder(FAIL, self.leader, '')
+                    msg[INDEX] = append_from
+                    self.send(msg)
+
+            # All RPCs received by a follower resets timeout (heartbeats)
+            self.reset_timeout()
+
+    # Returns where to append from to enforce Consistency Check
+    #   Does there exist an entry previous the appending index?
+    #   Does that entry match term with the given prevTerm?
+    def check_consistency(self, prevIndex, prevTerm):
+        # First entry, trivially consistent
+        if prevIndex == -1:
+            return 0
+        
+        # Entry at previous index doesn't exist
+        if len(self.log) <= prevIndex:
+            return len(self.log)
+        # Entry at previous index exists and its term matches
+        elif self.log[prevIndex][TERM] == prevTerm:
+            return prevIndex + 1
+        # Entry at previous index exists but its term is mismatched
+        else:
+            return prevIndex
+
+    # Handles OK messages from follower that successfully appends entries
+    def okay_handler(self, message):
+        req = json.loads(message)
+
+        if self.role == Role.LEADER:
+            entry_index = int(req[INDEX])
+            self.log_quorum[entry_index] += 1
+            # Reaches quorum
+            if self.log_quorum[entry_index] == self.quorum:
+                self.commit_up_to(entry_index)
+
+
+    # Handles FAIL messages from follower that fails to append entries
+    def fail_handler(self, message):
+        req = json.loads(message)
+
+        append_from = int(req[INDEX])
+
+        # Sends a new AppendEntries RPC with an updated append-from index
+        self.send_rpc(req[SRC], append_from, self.currentLength - 1)
+    
+    # Sends out AppendEntries RPC as either heartbeat or to replicate entries
+    def send_appends(self):
+
+        # Send new AppendEntries RPCs with latest log
+        if (self.new_entries > 0): 
+
+            # Send RPC with all (new) uncommitted entries
+            for r in self.others:
+                self.send_rpc(r, self.lastIndexCommitted+1, len(self.log))
+
+            self.reset_rpc_timeout()
+            self.new_entries = 0
+        # Retries RPC if its entries aren't committed yet and it has timed-out
+        elif (self.log_quorum[-1] < self.quorum \
+            and self.rpc_timeout <= time.time()):
+
+            # Resends RPC with all uncommitted entries
+            for r in self.others:
+                self.send_rpc(r, self.lastIndexCommitted+1, len(self.log))
+
+            self.reset_rpc_timeout()
+        # Sends empty "heartbeat" RPC otherwise
+        else:
+            for r in self.others:
+                self.send_rpc(r, -1, -1)
+
+    # Sends RPC to the given dst w/ specified entries
+    # - start (inclusive), end (exclusive)
+    # - "-1" start, end represent empty RPC
+    def send_rpc(self, dst, start, end):
+        # split up into batches
+        num_batches = math.ceil((end - start) / 10)
+        for i in range(num_batches):
+            batchStart = start + (10 * i)
+            batchEnd = start + 10 + (10 * i)
+            msg = self.default_message_builder(APPEND, dst, '')
+
+            # Entries to append (split up)
+            batchEntries = self.log[batchStart:batchEnd]
+
+            # Field used to enforce Consistency Check
+            if (batchStart - 1 < 0): 
+                msg["matchTerm"] = -1
+            else: 
+                msg["matchTerm"] = self.log[batchStart-1][TERM]
+            msg["appendFrom"] = batchStart
+            msg[INDEX] = batchEnd - 1
+            msg[TERM] = self.log[batchStart + len(batchEntries) - 1][TERM]
+            msg[ENTRIES] = batchEntries
+
+            self.send(msg)
+
+        # Heartbeat
+        if start == -1 and end == -1:
+            msg = self.default_message_builder(APPEND, dst, '')
+            self.send(msg)
+    
+    # Resets timeout for AppendEntries RPC message containing entries
+    def reset_rpc_timeout(self):
+        self.rpc_timeout = time.time() + RPC_TIMEOUT
+    
+    # Commits up to the given index 
+    def commit_up_to(self, index):
+        if (index > self.lastIndexCommitted and self.currentLength > index):
+            # Commits entries from the last uncommitted entry to the given index
+            for i in range(self.lastIndexCommitted+1, index+1):
+                entry = self.log[i]
+
+                # Commit entry to datastore
+                self.data[entry[KEY]] = entry[VAL]
+
+                if self.role == Role.LEADER:
+                    # Send OK message to client to inform of successful PUT request
+                    msg = self.default_message_builder(OK, entry[SRC], entry[MID])
+                    self.send(msg)
+
+            # Commit the entry at given index and preceding entries, provided not already committed
+            # Update log quorum to have consistent quorum values for the last index committed
+            if Role.LEADER == self.role:
+                for i in reversed(range(0, index+1)):
+                    # Break when reaching committed entires
+                    if self.log_quorum[i] >= self.quorum:
+                        break
+                    # Set committed entry to quorum
+                    else:
+                        self.log_quorum[i] = self.quorum
+            
+            # Update last index committed
+            self.lastIndexCommitted = index
+        
+        # Send type "commit" messages to replicas to tell them to commit, send with <index, term> to match
+        # Commit using check_consistency
+        # note: need to differentiate FAIL msgs for RPCs and commits
+        # TODO this commit mechanism can probably be more optimized and work with Consistency Check, this is more
+        # lightweight implementation
+
+        if Role.LEADER == self.role:
+            # Send type COMMIT messages to followers to tell them to commit if their log is up-to-date
+            for r in self.others:
+                msg = self.default_message_builder(COMMIT, r, '')
+                msg[INDEX] = self.lastIndexCommitted
+                msg["matchTerm"] = self.log[self.lastIndexCommitted][TERM]
+                self.send(msg)
+
+    # Handles COMMIT messages 
+    def commit_handler(self, message):
+        req = json.loads(message)
+
+        prevIndex = int(req[INDEX]) - 1
+        prevTerm = int(req["matchTerm"])
+        
+        # Determines whether this follower can commit its log up to the given index
+        if self.check_consistency(prevIndex, prevTerm) == int(req[INDEX]):
+            self.commit_up_to(int(req[INDEX]))
+
+    def request_handler(self, message):
+        req = json.loads(message)
+
+        if req[TYPE] == PUT:
+            self.put_handler(message)
+        elif req[TYPE] == GET:
+            self.get_handler(message)
+        elif req[TYPE] == REQ_VOTE:
+            self.vote_request_handler(message)
+        elif req[TYPE] == VOTE:
+            self.count_vote()
+        elif req[TYPE] == APPEND:
+            self.append_handler(message)
+        elif req[TYPE] == OK:
+            self.okay_handler(message)
+        elif req[TYPE] == FAIL:
+            self.fail_handler(message)
+        elif req[TYPE] == COMMIT:
+            self.commit_handler(message)
+    
+    def run(self):
+
+        while True:
+            data, addr = self.socket.recvfrom(65535)
+            msg = data.decode('utf-8')
+            # if self.id == '0004' and self.term == 0:
+            #     self.start_election()
+
+            # Timeout (s)
+            # Leader: Sends followers AppendEntries RPCs to keep-alive and replicate
+            # Follower: Starts an election and becomes candidate
+            self.request_handler(msg)
+
+            if self.timeout <= time.time():
+                if self.role == Role.LEADER:
+                    # Sends AppendEntries RPCs to followers with unreplicated entries, if no 
+                    # uncommitted entries, sends heartbeat RPC
+                    self.send_appends()
+                if self.role in [Role.FOLLOWER, Role.CANDIDATE] and self.currentLength != 0 and (self.term + 1) not in self.vote_for_term.keys():
+                    print('election happen', self.term + 1)
+                    self.start_election()
+                self.reset_timeout()
+            
+
+            print("Received message '%s'" % (msg,), flush=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
